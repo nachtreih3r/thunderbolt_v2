@@ -22,8 +22,6 @@ except Exception as e:
 # --- Upload DGR .xlsx -> use your Stage2 helpers -> save master.csv ---
 import io
 import pandas as pd
-import streamlit as st
-from src.github_store import get_file, put_file
 from src.stage2 import _drop_summary_rows, _drop_duplicate_brine_cols, _flatten_columns, COL_RENAME_MAP
 
 st.subheader("Upload DGR .xlsx → update master.csv (uses Stage 2 cleaning)")
@@ -35,9 +33,9 @@ TIMESTAMP_FORMAT = "%d-%m-%Y %H%MH"   # match your stage2 default
 def steamfield_from_xlsx_filelike(file_like, source_name: str) -> pd.DataFrame:
     # Try your Stage1 read pattern first; fallback if needed
     try:
-        df = pd.read_excel(file_like, sheet_name="Steamfield", header=[0, 1], skiprows=[0])
+        df = pd.read_excel(file_like, sheet_name="Steamfield", header=[0, 1], skiprows=[0], engine="openpyxl")
     except Exception:
-        df = pd.read_excel(file_like, sheet_name="Steamfield", header=[0, 1])
+        df = pd.read_excel(file_like, sheet_name="Steamfield", header=[0, 1], engine="openpyxl")
     # Stage 2 helpers
     df = _drop_summary_rows(df)
     df = _drop_duplicate_brine_cols(df)
@@ -81,7 +79,7 @@ if files:
     if blob is None or len(blob) == 0:
         master_df = pd.DataFrame()
     else:
-        master_df = pd.read_csv
+        master_df = pd.read_csv(io.BytesIO(blob))
 
     # 3) Merge new chunks into master
     if master_df.empty:
@@ -105,5 +103,4 @@ if files:
         "Download current master.csv",
         data=out_buf.getvalue(),
         file_name="master.csv",
-        mime="text/csv"
-    )
+        mime="text/csv")
