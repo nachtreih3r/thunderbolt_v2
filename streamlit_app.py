@@ -315,7 +315,7 @@ with tab1:
 
     # Queue in session_state
     if "upload_queue" not in st.session_state:
-        st.session_state.upload_queue: List[dict] = []
+        st.session_state.upload_queue = []
 
     # Uploader
     new_files = st.file_uploader(
@@ -405,7 +405,8 @@ with tab1:
 # -------------------- Tab 2: Master CSV --------------------
 with tab2:
     st.subheader("Complete merged CSV preview")
-
+    if st.button("Refresh from GitHub", help="Reload latest master.csv"):
+        st.rerun()
     master_df, _ = load_master()
     if master_df is None or master_df.empty:
         st.info("master.csv is empty. Upload & process files in Tab 1.")
