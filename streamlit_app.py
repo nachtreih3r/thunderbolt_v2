@@ -1,3 +1,175 @@
+# ---- Password gate with persistent lockout & Remember Me ----
+import time, hmac, hashlib, base64, os
+import streamlit as st
+
+# allow either top-level secrets or nested under [auth] in secrets.toml
+def _secret(key, default=None):
+    if key in st.secrets:
+        return st.secrets.get(key, default)
+    if "auth" in st.secrets and key in st.secrets["auth"]:
+        return st.secrets["auth"].get(key, default)
+    return default
+
+try:
+    import bcrypt
+    from streamlit_cookies_manager import CookieManager
+except Exception:
+    pass  # handled below
+
+MAX_ATTEMPTS       = 5
+COOLDOWN_SECONDS   = 5 * 60      # 5 minutes
+REMEMBER_DAYS      = 3
+COOKIE_PREFIX      = "tb_"
+COOKIE_AUTH_NAME   = COOKIE_PREFIX + "auth"
+COOKIE_LOCK_NAME   = COOKIE_PREFIX + "lock_until"
+COOKIE_CLIENT_NAME = COOKIE_PREFIX + "cid"
+SECRET             = _secret("COOKIE_SECRET", "")
+
+def _cookies_ready():
+    try:
+        cm = CookieManager()
+        if not cm.ready():
+            st.stop()  # wait until cookies are ready
+        return cm
+    except Exception:
+        st.error("Cookie manager missing. Add 'streamlit-cookies-manager' to requirements.txt.")
+        st.stop()
+
+def _b64(s: bytes) -> str:
+    return base64.urlsafe_b64encode(s).decode().rstrip("=")
+
+def _unb64(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode())
+
+def _sign(data: str) -> str:
+    return _b64(hmac.new(SECRET.encode(), data.encode(), hashlib.sha256).digest())
+
+def _make_token(client_id: str, exp_ts: int) -> str:
+    payload = f"{client_id}.{exp_ts}"
+    sig = _sign(payload)
+    return f"{_b64(payload.encode())}.{sig}"
+
+def _check_token(token: str, client_id: str) -> bool:
+    try:
+        payload_b64, sig = token.split(".", 1)
+        payload = _unb64(payload_b64).decode()
+        if not hmac.compare_digest(_sign(payload), sig):
+            return False
+        cid, exp_str = payload.split(".", 1)
+        if not hmac.compare_digest(cid, client_id):
+            return False
+        return time.time() < int(exp_str)
+    except Exception:
+        return False
+
+def _now_int() -> int:
+    return int(time.time())
+
+def require_password():
+    # deps & secrets check
+    if "bcrypt" not in globals() or "CookieManager" not in globals():
+        st.error("Missing deps. Ensure 'bcrypt' and 'streamlit-cookies-manager' are in requirements.txt.")
+        st.stop()
+    if not _secret("APP_PASS_HASH") or not _secret("COOKIE_SECRET"):
+        st.error("Missing secrets. Set APP_PASS_HASH and COOKIE_SECRET in Streamlit Secrets.")
+        st.stop()
+
+    cookies = _cookies_ready()
+
+    # anonymous client id cookie
+    client_id = cookies.get(COOKIE_CLIENT_NAME)
+    if not client_id:
+        client_id = _b64(os.urandom(16))
+        cookies[COOKIE_CLIENT_NAME] = client_id
+        cookies.save()
+
+    # remember-me cookie
+    auth_token = cookies.get(COOKIE_AUTH_NAME)
+    if auth_token and _check_token(auth_token, client_id):
+        st.session_state["auth_ok"] = True
+
+    # already authed
+    if st.session_state.get("auth_ok"):
+        if st.sidebar.button("Log out"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            cookies[COOKIE_AUTH_NAME] = ""
+            cookies.save()
+            st.rerun()
+        return True
+
+    # lockout via cookie (survives refresh/restart)
+    lock_until = cookies.get(COOKIE_LOCK_NAME)
+    if lock_until:
+        try:
+            if _now_int() < int(lock_until):
+                remaining = int(lock_until) - _now_int()
+                st.title("Thunderbolt V2 — Login")
+                st.error(f"Too many attempts. Try again in {remaining}s.")
+                st.stop()
+        except Exception:
+            pass
+
+    # login form
+    st.title("Thunderbolt V2 — Login")
+    pwd = st.text_input("Enter password", type="password").strip()
+    c1, c2 = st.columns([1,1])
+    with c1:
+        remember = st.checkbox(f"Remember me for {REMEMBER_DAYS} days")
+    with c2:
+        login = st.button("Login", type="primary", use_container_width=True)
+
+        if login:
+            try:
+                pass_hash = _secret("APP_PASS_HASH")
+                ok = bcrypt.checkpw(pwd.encode("utf-8"), pass_hash.encode("utf-8"))
+                if hmac.compare_digest(str(bool(ok)), "True"):
+                    st.session_state["auth_ok"] = True
+                    if remember:
+                        exp_ts = _now_int() + REMEMBER_DAYS * 24 * 3600
+                        token = _make_token(client_id, exp_ts)
+                        cookies[COOKIE_AUTH_NAME] = token
+                        cookies.save()
+                    # clear lock + attempts, then proceed
+                    cookies[COOKIE_LOCK_NAME] = ""
+                    cookies.save()
+                    st.session_state.pop("attempts", None)
+                    st.rerun()
+                else:
+                    attempts = st.session_state.get("attempts", 0) + 1
+                    st.session_state["attempts"] = attempts
+                    remaining = MAX_ATTEMPTS - attempts
+                    if remaining <= 0:
+                        cookies[COOKIE_LOCK_NAME] = str(_now_int() + COOLDOWN_SECONDS)
+                        cookies.save()
+                        st.error(f"Too many attempts. Locked for {COOLDOWN_SECONDS//60} minutes.")
+                    else:
+                        st.error(f"Incorrect password. {remaining} attempt(s) left.")
+            except Exception as e:
+                st.error(f"Auth error: {e}")
+
+    st.stop()  # block the rest of the app until authenticated
+
+# Call the gate before rendering the app
+require_password()
+
+# (optional) simple logout anywhere after this point
+try:
+    from streamlit_cookies_manager import CookieManager as _CM
+    if st.session_state.get("auth_ok") and st.sidebar.button("Log out"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        cm = _CM()
+        if cm.ready():
+            cm[COOKIE_AUTH_NAME] = ""
+            cm.save()
+        st.rerun()
+except Exception:
+    pass
+# ---- end password gate ----
+
+
 import io
 from typing import List, Optional, Tuple
 

@@ -4,3 +4,5 @@ numpy
 openpyxl
 iapws
 requests
+bcrypt
+streamlit-cookies-manager
