@@ -438,7 +438,325 @@ with tab2:
             except Exception as e:
                 st.error(f"Flush failed: {e}")
 
-# -------------------- Tab 3: Analysis (placeholder) --------------------
+# -------------------- Tab 3: IF97 Regions (analysis) --------------------
+# pip install iapws
+import io
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+@st.cache_resource
+def _load_iapws():
+    """Lazy import so app still boots even if iapws isn't installed locally."""
+    try:
+        from iapws.iapws97 import _Region1, _Region2, _Region3, _Region4, _Region5, _TSat_P, _PSat_T
+        return dict(
+            _Region1=_Region1, _Region2=_Region2, _Region3=_Region3, _Region4=_Region4, _Region5=_Region5,
+            _TSat_P=_TSat_P, _PSat_T=_PSat_T
+        )
+    except Exception as e:
+        raise RuntimeError("iapws package not available. Install with: pip install iapws") from e
+
+
+REGIONS = {
+    "Region 1 (compressed water: T,P)": {
+        "desc": "Subcooled/Compressed liquid water. Inputs: Temperature [K], Pressure [MPa].",
+        "inputs": [("T (K)", "T"), ("P (MPa)", "P")],
+        "returns": [
+            ("v", "Specific volume [m³/kg]"),
+            ("h", "Specific enthalpy [kJ/kg]"),
+            ("s", "Specific entropy [kJ/(kg·K)]"),
+            ("cp", "Isobaric heat capacity [kJ/(kg·K)]"),
+            ("cv", "Isochoric heat capacity [kJ/(kg·K)]"),
+            ("w", "Speed of sound [m/s]"),
+            ("alfav", "Cubic expansion coeff. [1/K]"),
+            ("kt", "Isothermal compressibility [1/MPa]"),
+        ],
+        "fn": "_Region1",
+    },
+    "Region 2 (superheated steam: T,P)": {
+        "desc": "Superheated vapor/gas. Inputs: Temperature [K], Pressure [MPa].",
+        "inputs": [("T (K)", "T"), ("P (MPa)", "P")],
+        "returns": [
+            ("v", "Specific volume [m³/kg]"),
+            ("h", "Specific enthalpy [kJ/kg]"),
+            ("s", "Specific entropy [kJ/(kg·K)]"),
+            ("cp", "Isobaric heat capacity [kJ/(kg·K)]"),
+            ("cv", "Isochoric heat capacity [kJ/(kg·K)]"),
+            ("w", "Speed of sound [m/s]"),
+            ("alfav", "Cubic expansion coeff. [1/K]"),
+            ("kt", "Isothermal compressibility [1/MPa]"),
+        ],
+        "fn": "_Region2",
+    },
+    "Region 3 (near-critical dense: rho,T)": {
+        "desc": "High-density/near-critical. Inputs: Density [kg/m³], Temperature [K].",
+        "inputs": [("rho (kg/m³)", "rho"), ("T (K)", "T")],
+        "returns": [
+            ("v", "Specific volume [m³/kg]"),
+            ("h", "Specific enthalpy [kJ/kg]"),
+            ("s", "Specific entropy [kJ/(kg·K)]"),
+            ("cp", "Isobaric heat capacity [kJ/(kg·K)]"),
+            ("cv", "Isochoric heat capacity [kJ/(kg·K)]"),
+            ("w", "Speed of sound [m/s]"),
+            ("alfav", "Cubic expansion coeff. [1/K]"),
+            ("kt", "Isothermal compressibility [1/MPa]"),
+        ],
+        "fn": "_Region3",
+    },
+    "Region 4 (saturation: P,x)": {
+        "desc": "Two-phase boundary (liquid↔vapor). Inputs: Pressure [MPa], Quality x [-].",
+        "inputs": [("P (MPa)", "P"), ("x (quality)", "x")],
+        "returns": [
+            ("T", "Saturated temperature [K]"),
+            ("P", "Saturated pressure [MPa]"),
+            ("x", "Vapor quality [-]"),
+            ("v", "Specific volume [m³/kg]"),
+            ("h", "Specific enthalpy [kJ/kg]"),
+            ("s", "Specific entropy [kJ/(kg·K)]"),
+        ],
+        "fn": "_Region4",
+    },
+    "Region 5 (high-T steam: T,P)": {
+        "desc": "Very hot steam region. Inputs: Temperature [K], Pressure [MPa].",
+        "inputs": [("T (K)", "T"), ("P (MPa)", "P")],
+        "returns": [
+            ("v", "Specific volume [m³/kg]"),
+            ("h", "Specific enthalpy [kJ/kg]"),
+            ("s", "Specific entropy [kJ/(kg·K)]"),
+            ("cp", "Isobaric heat capacity [kJ/(kg·K)]"),
+            ("cv", "Isochoric heat capacity [kJ/(kg·K)]"),
+            ("w", "Speed of sound [m/s]"),
+            ("alfav", "Cubic expansion coeff. [1/K]"),
+            ("kt", "Isothermal compressibility [1/MPa]"),
+        ],
+        "fn": "_Region5",
+    },
+}
+
+# ---------- Timestamp parsing/formatting for 'DD-MM-YYYY HH00H' ----------
+_TS_FORMAT = "%d-%m-%Y %H%M"  # e.g., '01-06-2025 0100'
+
+def _parse_ddmmyyyy_hh00h(series: pd.Series) -> pd.Series:
+    """Parse 'DD-MM-YYYY HH00H' -> datetime; non-parsable -> NaT."""
+    s = series.astype(str).str.strip()
+    # turn '0100H' -> '0100'
+    s = s.str.replace(r"\s*(\d{4})H\s*$", r" \1", regex=True)
+    return pd.to_datetime(s, format=_TS_FORMAT, errors="coerce")
+
+def _format_ddmmyyyy_hh00h(obj):
+    """
+    Format datetime to 'DD-MM-YYYY HH00H'.
+    - If obj is Series/DatetimeIndex -> returns Series of strings
+    - If obj is scalar -> returns a single string
+    """
+    if isinstance(obj, (pd.Series, pd.DatetimeIndex)):
+        return pd.to_datetime(obj).dt.strftime("%d-%m-%Y %H00H")
+    else:
+        return pd.to_datetime([obj]).strftime("%d-%m-%Y %H00H")[0]
+
+def _resolve_datetime(master_df: pd.DataFrame) -> pd.Series:
+    """
+    Return a datetime Series from common patterns:
+    1) 'Timestamp' in 'DD-MM-YYYY HH00H'
+    2) 'timestamp' already parseable
+    3) 'Date' + 'Time'
+    4) First parseable date-like column
+    """
+    # 1) Explicit 'Timestamp' like in your screenshot
+    for name in ["Timestamp", "TIMESTAMP", "timestamp_str"]:
+        if name in master_df.columns:
+            ts = _parse_ddmmyyyy_hh00h(master_df[name])
+            if ts.notna().any():
+                return ts
+
+    # 2) Generic 'timestamp'
+    if "timestamp" in master_df.columns:
+        ts = pd.to_datetime(master_df["timestamp"], errors="coerce")
+        if ts.notna().any():
+            return ts
+
+    # 3) Date + Time
+    if {"Date", "Time"}.issubset(master_df.columns):
+        return pd.to_datetime(
+            master_df["Date"].astype(str) + " " + master_df["Time"].astype(str),
+            errors="coerce"
+        )
+
+    # 4) Heuristic fallback
+    for c in master_df.columns:
+        if any(k in c.lower() for k in ("time", "date", "datetime", "timestamp")):
+            s = pd.to_datetime(master_df[c], errors="coerce")
+            if s.notna().any():
+                return s
+
+    raise ValueError("Could not parse a datetime column. Expected 'Timestamp' (DD-MM-YYYY HH00H), 'timestamp', or 'Date'+'Time'.")
+
+
+def _column_mapper_ui(df: pd.DataFrame, inputs):
+    """UI to map required inputs to CSV columns. Returns dict of key->column."""
+    st.subheader("Map CSV columns to required inputs")
+    mapping = {}
+    for label, key in inputs:
+        # small guesser
+        guess = None
+        for col in df.columns:
+            low = col.lower()
+            if key == "T" and (low in ("t", "temp", "temperature") or low.endswith("_k")):
+                guess = col
+            if key == "P" and (low in ("p", "press", "pressure") or "mpa" in low):
+                guess = col
+            if key == "rho" and ("rho" in low or "dens" in low):
+                guess = col
+            if key == "x" and (low == "x" or "quality" in low):
+                guess = col
+        mapping[key] = st.selectbox(
+            f"{label}", ["— select —"] + list(df.columns),
+            index=(df.columns.tolist().index(guess) + 1) if guess in df.columns else 0
+        )
+    return mapping
+
+
+def _compute_row(fn, region_name: str, row: pd.Series, mapping: dict):
+    """Call the selected Region function for a single row, return dict or None."""
+    try:
+        if region_name.startswith(("Region 1", "Region 2", "Region 5")):
+            return fn(float(row[mapping["T"]]), float(row[mapping["P"]]))
+        if region_name.startswith("Region 3"):
+            return fn(float(row[mapping["rho"]]), float(row[mapping["T"]]))
+        if region_name.startswith("Region 4"):
+            return fn(float(row[mapping["P"]]), float(row[mapping["x"]]))
+    except Exception:
+        return None
+
+
+def _validate_inputs(region_name: str, row: pd.Series, mapping: dict) -> tuple[bool, str | None]:
+    """Light prevalidation to avoid silent NaNs."""
+    try:
+        if region_name.startswith(("Region 1", "Region 2", "Region 5")):
+            T = float(row[mapping["T"]]); P = float(row[mapping["P"]])
+            if not np.isfinite(T) or not np.isfinite(P): return False, "Non-numeric T/P"
+            if T <= 0 or P <= 0: return False, "T or P <= 0"
+        elif region_name.startswith("Region 3"):
+            rho = float(row[mapping["rho"]]); T = float(row[mapping["T"]])
+            if not np.isfinite(rho) or not np.isfinite(T): return False, "Non-numeric rho/T"
+            if rho <= 0 or T <= 0: return False, "rho or T <= 0"
+        elif region_name.startswith("Region 4"):
+            P = float(row[mapping["P"]]); x = float(row[mapping["x"]])
+            if not np.isfinite(P) or not np.isfinite(x): return False, "Non-numeric P/x"
+            if P <= 0 or not (0.0 <= x <= 1.0): return False, "P<=0 or x not in [0,1]"
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def render_tab3_iapws(master_df: pd.DataFrame):
+    st.subheader("IAPWS‑IF97 Regions")
+    st.caption("Pick a time window, a Region, map inputs from your CSV, choose outputs, then execute.")
+
+    try:
+        ts = _resolve_datetime(master_df)
+    except Exception as e:
+        st.error(str(e))
+        return
+
+    df = master_df.copy()
+    df["__ts__"] = pd.to_datetime(ts)
+
+    # -------- Step 1 — Date & time range --------
+    st.markdown("**Step 1 — Date & time range**")
+
+    min_dt = pd.to_datetime(df["__ts__"].min())
+    max_dt = pd.to_datetime(df["__ts__"].max())
+
+    # Show available window in your format
+    st.caption(f"Available window: {_format_ddmmyyyy_hh00h(min_dt)} → {_format_ddmmyyyy_hh00h(max_dt)}")
+
+    start, end = st.slider(
+        "Window",
+        min_value=min_dt.to_pydatetime(),
+        max_value=max_dt.to_pydatetime(),
+        value=(min_dt.to_pydatetime(), max_dt.to_pydatetime()),
+        format="YYYY-MM-DD HH:mm",  # slider display; we print your custom format separately
+    )
+    mask = (df["__ts__"] >= pd.to_datetime(start)) & (df["__ts__"] <= pd.to_datetime(end))
+    dfw = df.loc[mask].reset_index(drop=True)
+    st.caption(f"Rows in window: {len(dfw):,}")
+
+    # -------- Step 2 — Region selection --------
+    st.markdown("**Step 2 — Select IF97 Region**")
+    region_names = list(REGIONS.keys())
+    region_choice = st.selectbox("Region", region_names)
+    st.info(REGIONS[region_choice]["desc"])
+
+    # Input mapping
+    mapping = _column_mapper_ui(dfw, REGIONS[region_choice]["inputs"])
+
+    # -------- Step 3 — Returns selection --------
+    st.markdown("**Step 3 — Choose returns**")
+    ret_pairs = REGIONS[region_choice]["returns"]
+    ret_labels = [f"{k} — {desc}" for k, desc in ret_pairs]
+    chosen_labels = st.multiselect("Outputs (multi‑select)", ret_labels, default=[ret_labels[0]])
+    chosen_keys = [lbl.split(" — ")[0] for lbl in chosen_labels]
+
+    # -------- Step 4 — Execute --------
+    st.markdown("**Step 4 — Execute**")
+    if st.button("Run IAPWS computation", type="primary"):
+        if any(v == "— select —" for v in mapping.values()):
+            st.error("Please map all required inputs to CSV columns.")
+            st.stop()
+
+        lib = _load_iapws()
+        fn = lib[REGIONS[region_choice]["fn"]]
+
+        error_msgs = []
+        out_rows = []
+        for idx, r in dfw.iterrows():
+            ok, msg = _validate_inputs(region_choice, r, mapping)
+            if not ok:
+                if len(error_msgs) < 5:
+                    error_msgs.append(f"Row {idx}: {msg}")
+                d = {k: np.nan for k, _ in ret_pairs}
+            else:
+                try:
+                    d = _compute_row(fn, region_choice, r, mapping)
+                    if d is None:
+                        d = {k: np.nan for k, _ in ret_pairs}
+                except Exception as e:
+                    if len(error_msgs) < 5:
+                        error_msgs.append(f"Row {idx}: {type(e).__name__}: {e}")
+                    d = {k: np.nan for k, _ in ret_pairs}
+
+            row_out = {"timestamp": r["__ts__"]}
+            # include inputs used for traceability
+            for k, col in mapping.items():
+                row_out[col] = r[col]
+            # include requested returns
+            for k in chosen_keys:
+                row_out[k] = d.get(k, np.nan)
+            out_rows.append(row_out)
+
+        result = pd.DataFrame(out_rows)
+
+        # Format timestamp to 'DD-MM-YYYY HH00H' for display/export
+        result.insert(0, "Timestamp", _format_ddmmyyyy_hh00h(result["timestamp"]))
+        # Order: Timestamp | inputs | outputs
+        input_cols = list(mapping.values())
+        cols = ["Timestamp"] + input_cols + chosen_keys
+        result = result[cols]
+
+        st.dataframe(result, use_container_width=True)
+
+        if error_msgs:
+            st.warning("Some rows could not be computed. First few issues:\n- " + "\n- ".join(error_msgs))
+
+        # downloadable CSV
+        buf = io.StringIO()
+        result.to_csv(buf, index=False)
+        st.download_button("Download CSV", buf.getvalue().encode("utf-8"),
+                           file_name="iapws_results.csv", mime="text/csv")
+
+
+# === integrate into your existing tabs ===
 with tab3:
-    st.subheader("Analysis workspace (coming soon)")
-    st.caption("We will add IAPWS-based calculations and visualizations here next.")
+    render_tab3_iapws(master_df)
