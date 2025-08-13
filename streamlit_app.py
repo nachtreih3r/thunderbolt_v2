@@ -1,6 +1,7 @@
 # ---- Password gate with persistent lockout & Remember Me ----
 import time, hmac, hashlib, base64, os
 import streamlit as st
+st.set_page_config(page_title="Thunderbolt V2", layout="wide")
 
 # allow either top-level secrets or nested under [auth] in secrets.toml
 def _secret(key, default=None):
@@ -169,12 +170,9 @@ except Exception:
     pass
 # ---- end password gate ----
 
-
 import io
 from typing import List, Optional, Tuple
-
 import pandas as pd
-import streamlit as st
 
 from src.github_store import get_file, put_file
 from src.stage2 import (
@@ -185,7 +183,6 @@ from src.stage2 import (
 )
 
 # ---------- App Config ----------
-st.set_page_config(page_title="Thunderbolt V2", layout="wide")
 TITLE = "Thunderbolt V2 — GitHub Storage"
 DATA_PATH = "master.csv"
 TIMESTAMP_FORMAT = "%d-%m-%Y %H%MH"  # keep consistent with your stage2 default
@@ -195,9 +192,9 @@ def debug_sidebar() -> None:
     st.sidebar.header("Debug")
     repo = st.secrets.get("GITHUB_REPO")
     branch = st.secrets.get("GITHUB_BRANCH", "main")
-    st.sidebar.write(f"Repo: `{repo}`")
-    st.sidebar.write(f"Branch: `{branch}`")
-    st.sidebar.write(f"Path: `{DATA_PATH}`")
+    st.sidebar.write(f"Repo: {repo}")
+    st.sidebar.write(f"Branch: {branch}")
+    st.sidebar.write(f"Path: {DATA_PATH}")
 
     blob, sha = get_file(DATA_PATH)
     size_now = len(blob) if blob else 0
@@ -218,7 +215,7 @@ def show_commit(result: dict) -> None:
     commit_url = result.get("commit", {}).get("html_url")
     commit_sha = result.get("commit", {}).get("sha", "")[:7]
     if commit_url:
-        st.success(f"master.csv updated in GitHub ✅ • commit `{commit_sha}`")
+        st.success(f"master.csv updated in GitHub ✅ • commit {commit_sha}")
         st.write(commit_url)
     else:
         st.success("master.csv updated in GitHub ✅")
@@ -411,7 +408,7 @@ with tab2:
 
     master_df, _ = load_master()
     if master_df is None or master_df.empty:
-        st.info("`master.csv` is empty. Upload & process files in Tab 1.")
+        st.info("master.csv is empty. Upload & process files in Tab 1.")
     else:
         st.write(f"Rows: **{len(master_df):,}**")
         if "Timestamp" in master_df.columns:
@@ -429,7 +426,7 @@ with tab2:
     st.markdown("---")
     st.subheader("Danger zone")
     with st.expander("Flush master.csv (wipe all data)"):
-        st.write("This replaces `master.csv` in GitHub with an empty file. Old versions remain in commit history.")
+        st.write("This replaces master.csv in GitHub with an empty file. Old versions remain in commit history.")
         confirm = st.checkbox("I understand and want to empty master.csv", key="confirm_flush_tab2")
         if st.button("Flush now", type="primary", disabled=not confirm, key="flush_button_tab2"):
             try:
