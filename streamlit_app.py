@@ -616,39 +616,111 @@ def _column_mapper_ui(df: pd.DataFrame, inputs):
         )
     return mapping
 
-
-def _compute_row(fn, region_name: str, row: pd.Series, mapping: dict):
-    """Call the selected Region function for a single row, return dict or None."""
+def _compute_row(fn, region_name: str, row: pd.Series, mapping: dict,
+                 use_celsius_for_T: bool, p_unit: str, convert_units: bool):
+    """Normalize then call the Region function. Returns the region dict or None."""
     try:
         if region_name.startswith(("Region 1", "Region 2", "Region 5")):
-            return fn(float(row[mapping["T"]]), float(row[mapping["P"]]))
+            T = _norm_T_K(row[mapping["T"]], assume_celsius=use_celsius_for_T)
+            P = _norm_P_MPa(row[mapping["P"]], p_unit=p_unit, do_convert=convert_units)
+            return fn(float(T), float(P))
+
         if region_name.startswith("Region 3"):
-            return fn(float(row[mapping["rho"]]), float(row[mapping["T"]]))
+            rho = float(row[mapping["rho"]])
+            T = _norm_T_K(row[mapping["T"]], assume_celsius=use_celsius_for_T)
+            return fn(float(rho), float(T))
+
         if region_name.startswith("Region 4"):
-            return fn(float(row[mapping["P"]]), float(row[mapping["x"]]))
+            P = _norm_P_MPa(row[mapping["P"]], p_unit=p_unit, do_convert=convert_units)
+            x = float(row[mapping["x"]])
+            return fn(float(P), float(x))
     except Exception:
         return None
 
+# ---- Unit normalization for IF-97 (SI) ----
+_ATM_BAR = 1.01325  # standard atmosphere, bar
 
-def _validate_inputs(region_name: str, row: pd.Series, mapping: dict) -> tuple[bool, str | None]:
-    """Light prevalidation to avoid silent NaNs."""
+def _norm_T_K(val, assume_celsius: bool) -> float:
+    v = float(val)
+    return v + 273.15 if assume_celsius else v
+
+def _norm_P_MPa(val, p_unit: str, do_convert: bool) -> float:
+    """
+    Normalize pressure to MPa (absolute).
+    p_unit: 'barg', 'bara', 'MPa abs'
+    do_convert: if False, assume already MPa abs
+    """
+    v = float(val)
+    if not do_convert:
+        return v  # user says already MPa abs
+
+    u = p_unit.lower()
+    if u == "barg":
+        # barg -> bar(abs) -> MPa(abs)
+        return (v + _ATM_BAR) * 0.1
+    elif u == "bara":
+        # bar(abs) -> MPa(abs)
+        return v * 0.1
+    elif u.startswith("mpa"):
+        # MPa(abs) already
+        return v
+    else:
+        # fallback: assume MPa(abs)
+        return v
+
+def _validate_inputs(region_name: str, row: pd.Series, mapping: dict,
+                     use_celsius_for_T: bool, p_unit: str, convert_units: bool) -> tuple[bool, str | None]:
+    """Validate + normalize just enough to catch bad inputs early; do NOT mutate row."""
     try:
         if region_name.startswith(("Region 1", "Region 2", "Region 5")):
-            T = float(row[mapping["T"]]); P = float(row[mapping["P"]])
-            if not np.isfinite(T) or not np.isfinite(P): return False, "Non-numeric T/P"
-            if T <= 0 or P <= 0: return False, "T or P <= 0"
+            tcol, pcol = mapping["T"], mapping["P"]
+            try:
+                T = _norm_T_K(row[tcol], assume_celsius=use_celsius_for_T)
+                P = _norm_P_MPa(row[pcol], p_unit=p_unit, do_convert=convert_units)
+            except Exception:
+                return False, f"Selected T or P is non‑numeric (e.g., '{tcol}' or '{pcol}' isn’t numeric)."
+
+            if not np.isfinite(T) or not np.isfinite(P):
+                return False, "Non-numeric T/P"
+            if T <= 0 or P <= 0:
+                return False, "T or P <= 0"
+
+            if region_name.startswith("Region 1"):
+                if not (273.15 <= T <= 623.15):
+                    return False, f"T={T:.2f} K outside Region 1 range (273.15–623.15 K)"
+                lib = _load_iapws()
+                try:
+                    Psat = lib["_PSat_T"](T)
+                except Exception:
+                    return False, "Could not compute Psat(T)"
+                if P < Psat:
+                    return False, f"P={P:.4f} MPa < Psat(T)={Psat:.4f} MPa (not Region 1)"
+
         elif region_name.startswith("Region 3"):
-            rho = float(row[mapping["rho"]]); T = float(row[mapping["T"]])
-            if not np.isfinite(rho) or not np.isfinite(T): return False, "Non-numeric rho/T"
-            if rho <= 0 or T <= 0: return False, "rho or T <= 0"
+            try:
+                rho = float(row[mapping["rho"]])
+                T = _norm_T_K(row[mapping["T"]], assume_celsius=use_celsius_for_T)
+            except Exception:
+                return False, "Selected rho or T is non‑numeric."
+            if not np.isfinite(rho) or not np.isfinite(T):
+                return False, "Non-numeric rho/T"
+            if rho <= 0 or T <= 0:
+                return False, "rho or T <= 0"
+
         elif region_name.startswith("Region 4"):
-            P = float(row[mapping["P"]]); x = float(row[mapping["x"]])
-            if not np.isfinite(P) or not np.isfinite(x): return False, "Non-numeric P/x"
-            if P <= 0 or not (0.0 <= x <= 1.0): return False, "P<=0 or x not in [0,1]"
+            try:
+                P = _norm_P_MPa(row[mapping["P"]], p_unit=p_unit, do_convert=convert_units)
+                x = float(row[mapping["x"]])
+            except Exception:
+                return False, "Selected P or x is non‑numeric."
+            if not np.isfinite(P) or not np.isfinite(x):
+                return False, "Non-numeric P/x"
+            if P <= 0 or not (0.0 <= x <= 1.0):
+                return False, "P<=0 or x not in [0,1]"
+
         return True, None
     except Exception as e:
         return False, str(e)
-
 
 def render_tab3_iapws(master_df: pd.DataFrame):
     st.subheader("IAPWS‑IF97 Regions")
@@ -683,6 +755,18 @@ def render_tab3_iapws(master_df: pd.DataFrame):
     dfw = df.loc[mask].reset_index(drop=True)
     st.caption(f"Rows in window: {len(dfw):,}")
 
+    # -------- Units toggle --------
+    st.markdown("**Units**")
+    c1, c2, c3 = st.columns([1.5, 1.5, 2])
+    with c1:
+        use_celsius_for_T = st.checkbox("T is in °C", value=True, help="Converts T from °C → K for IF‑97")
+    with c2:
+        p_unit = st.radio("P unit", ["barg", "bara", "MPa abs"], index=0, horizontal=True,
+                          help="Converts P to MPa absolute for IF‑97")
+    with c3:
+        convert_units = st.checkbox("Convert to IF‑97 units", value=True,
+                                    help="If off, values are passed as-is (assumed K & MPa abs)")
+
     # -------- Step 2 — Region selection --------
     st.markdown("**Step 2 — Select IF97 Region**")
     region_names = list(REGIONS.keys())
@@ -712,14 +796,14 @@ def render_tab3_iapws(master_df: pd.DataFrame):
         error_msgs = []
         out_rows = []
         for idx, r in dfw.iterrows():
-            ok, msg = _validate_inputs(region_choice, r, mapping)
+            ok, msg = _validate_inputs(region_choice, r, mapping, use_celsius_for_T, p_unit, convert_units)
             if not ok:
                 if len(error_msgs) < 5:
                     error_msgs.append(f"Row {idx}: {msg}")
                 d = {k: np.nan for k, _ in ret_pairs}
             else:
                 try:
-                    d = _compute_row(fn, region_choice, r, mapping)
+                    d = _compute_row(fn, region_choice, r, mapping, use_celsius_for_T, p_unit, convert_units)
                     if d is None:
                         d = {k: np.nan for k, _ in ret_pairs}
                 except Exception as e:
